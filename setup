@@ -1,0 +1,6 @@
+#!/bin/bash
+set -e
+
+dropdb --force --if-exists testing
+createdb testing
+psql -d testing < migrate.sql
