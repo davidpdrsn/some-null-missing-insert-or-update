@@ -1,38 +1,85 @@
-#![allow(warnings)]
+#![allow(dead_code)]
 
-use bb8_postgres::{bb8, PostgresConnectionManager};
 use serde::Deserialize;
-use serde_json::json;
-use std::process::Command;
-
-mod patch;
 
 type DbPool =
     bb8_postgres::bb8::Pool<bb8_postgres::PostgresConnectionManager<tokio_postgres::NoTls>>;
 
 #[derive(Deserialize)]
 struct Update {
-    one: Option<String>,
-    two: Option<String>,
+    // double option to differentiate `null` and "missing"
+    #[serde(default, deserialize_with = "deserialize_some")]
+    one: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    two: Option<Option<String>>,
 }
 
-async fn insert_or_update(pool: &DbPool, internal_id: i64, update: Update) {
-    let con = pool.get().await.unwrap();
+// based on https://github.com/serde-rs/serde/issues/984#issuecomment-314143738
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: serde::de::Deserialize<'de>,
+    D: serde::de::Deserializer<'de>,
+{
+    serde::de::Deserialize::deserialize(deserializer).map(Some)
+}
 
-    con.execute(
-        r#"
-        insert into users (internal_id, one, two)
-        values ($1, $2, $3)
+impl Update {
+    async fn insert_or_update(self, internal_id: i64, pool: &DbPool) {
+        let mut con = pool.get().await.unwrap();
+        let tx = con.transaction().await.unwrap();
 
-        on conflict (internal_id)
-        do update set
-            one = coalesce(excluded.one, users.one)
-            , two = coalesce(excluded.two, users.two)
-        "#,
-        &[&internal_id, &update.one, &update.two],
-    )
-    .await
-    .unwrap();
+        // check if row exists, if it does lock it so others cannot query it
+        let row = tx
+            .query_opt(
+                r#"
+                select *
+                from users
+                where internal_id = $1
+                for update
+                "#,
+                &[&internal_id],
+            )
+            .await
+            .unwrap();
+
+        if let Some(row) = row {
+            // update the existing row
+            tx.execute(
+                r#"
+                update users
+                set
+                    one = $2
+                    , two = $3
+                where internal_id = $1
+                "#,
+                &[
+                    &internal_id,
+                    // if value wasn't specified set it to the current value
+                    &self.one.unwrap_or_else(|| row.get("one")),
+                    &self.two.unwrap_or_else(|| row.get("two")),
+                ],
+            )
+            .await
+            .unwrap();
+        } else {
+            tx.execute(
+                r#"
+                insert into users (internal_id, one, two)
+                values ($1, $2, $3)
+                "#,
+                &[
+                    &internal_id,
+                    // null and unspecified is the same for initial insert
+                    &self.one.flatten(),
+                    &self.two.flatten(),
+                ]
+            )
+            .await
+            .unwrap();
+        };
+
+        tx.commit().await.unwrap();
+    }
 }
 
 struct User {
@@ -63,11 +110,12 @@ async fn fetch(pool: &DbPool, internal_id: i64) -> User {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
     use super::*;
+    use bb8_postgres::{bb8, PostgresConnectionManager};
+    use serde_json::json;
+    use std::process::Command;
 
     #[tokio::test]
-    #[ignore]
     async fn works() {
         let pool = db_connect().await;
 
@@ -78,8 +126,8 @@ mod tests {
             "one": "1",
             "two": "1",
         });
-        let payload = serde_json::from_value(payload).unwrap();
-        insert_or_update(&pool, internal_id, payload).await;
+        let payload = serde_json::from_value::<Update>(payload).unwrap();
+        payload.insert_or_update(internal_id, &pool).await;
 
         let user = fetch(&pool, internal_id).await;
         assert_eq!(user.internal_id, 1);
@@ -91,8 +139,8 @@ mod tests {
             "one": "2",
             "two": "2",
         });
-        let payload = serde_json::from_value(payload).unwrap();
-        insert_or_update(&pool, internal_id, payload).await;
+        let payload = serde_json::from_value::<Update>(payload).unwrap();
+        payload.insert_or_update(internal_id, &pool).await;
 
         let user = fetch(&pool, internal_id).await;
         assert_eq!(user.internal_id, 1);
@@ -103,8 +151,8 @@ mod tests {
         let payload = json!({
             "one": "3",
         });
-        let payload = serde_json::from_value(payload).unwrap();
-        insert_or_update(&pool, internal_id, payload).await;
+        let payload = serde_json::from_value::<Update>(payload).unwrap();
+        payload.insert_or_update(internal_id, &pool).await;
 
         let user = fetch(&pool, internal_id).await;
         assert_eq!(user.one.as_deref(), Some("3"));
@@ -114,8 +162,8 @@ mod tests {
         let payload = json!({
             "two": "3",
         });
-        let payload = serde_json::from_value(payload).unwrap();
-        insert_or_update(&pool, internal_id, payload).await;
+        let payload = serde_json::from_value::<Update>(payload).unwrap();
+        payload.insert_or_update(internal_id, &pool).await;
 
         let user = fetch(&pool, internal_id).await;
         assert_eq!(user.one.as_deref(), Some("3"));
@@ -123,8 +171,8 @@ mod tests {
 
         // updating neither
         let payload = json!({});
-        let payload = serde_json::from_value(payload).unwrap();
-        insert_or_update(&pool, internal_id, payload).await;
+        let payload = serde_json::from_value::<Update>(payload).unwrap();
+        payload.insert_or_update(internal_id, &pool).await;
 
         let user = fetch(&pool, internal_id).await;
         assert_eq!(user.one.as_deref(), Some("3"));
@@ -132,13 +180,21 @@ mod tests {
 
         // setting one to `null`
         let payload = json!({ "one": null });
-        let payload = serde_json::from_value(payload).unwrap();
-        insert_or_update(&pool, internal_id, payload).await;
+        let payload = serde_json::from_value::<Update>(payload).unwrap();
+        payload.insert_or_update(internal_id, &pool).await;
 
         let user = fetch(&pool, internal_id).await;
         assert_eq!(user.one.as_deref(), None, "one == null");
         assert_eq!(user.two.as_deref(), Some("3"));
 
+        // change one, set two to null
+        let payload = json!({ "one": "1", "two": null });
+        let payload = serde_json::from_value::<Update>(payload).unwrap();
+        payload.insert_or_update(internal_id, &pool).await;
+
+        let user = fetch(&pool, internal_id).await;
+        assert_eq!(user.one.as_deref(), Some("1"));
+        assert_eq!(user.two.as_deref(), None);
     }
 
     async fn db_connect() -> DbPool {

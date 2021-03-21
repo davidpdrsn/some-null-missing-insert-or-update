@@ -3,4 +3,4 @@ set -e
 
 dropdb --force --if-exists testing
 createdb testing
-psql -d testing < migrate.sql
+psql -d testing < migrate-0001.sql
